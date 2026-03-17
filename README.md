@@ -2,7 +2,8 @@
 
 This repo contains the `ppr` skill at `skills/ppr`. The skill runs ping-pong
 code review between multiple coding agents and keeps its runtime files in a
-project-local `.ppr/` directory.
+project-local `.ppr/` directory. Each review session now lives under
+`.ppr/sessions/<id>/`, where `<id>` is the next available integer.
 
 Use this skill when you want one coding agent to act as the author and have
 other agents review the same change in structured rounds. It is for getting
@@ -36,6 +37,10 @@ The CLI exposes top-level help:
 skills/ppr/ppr --help
 ```
 
+By default, `ppr` commands target the highest existing session id. Use
+`--session-id N` to inspect or continue an older session, and use
+`skills/ppr/ppr clean --all` to remove every session plus `.ppr/agents.json`.
+
 Typical author flow:
 
 ```bash
@@ -50,3 +55,7 @@ skills/ppr/ppr respond --message "Addressed X, disagree on Y because Z"
 skills/ppr/ppr launch
 skills/ppr/ppr finish --commit --message "feat: description"
 ```
+
+Starting a second review in the same checkout is safe: another `ppr init`
+creates `.ppr/sessions/1`, then `.ppr/sessions/2`, and so on. Existing
+sessions stay intact unless you explicitly clean them.
