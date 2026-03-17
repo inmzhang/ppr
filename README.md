@@ -27,3 +27,28 @@ Copy the same skill into Claude Code's skills directory:
 mkdir -p ~/.claude/skills
 cp -r skills/ppr ~/.claude/skills/ppr
 ```
+
+## Quick Usage
+
+The CLI supports both top-level and subcommand help:
+
+```bash
+skills/ppr/ppr --help
+skills/ppr/ppr help init
+skills/ppr/ppr init --help
+```
+
+Typical author flow:
+
+```bash
+skills/ppr/ppr init \
+  --reviewers "claude-code:alice,codex:bob" \
+  --max-rounds 3 \
+  --context "Short description of the changes"
+skills/ppr/ppr launch
+skills/ppr/ppr wait --timeout 600
+skills/ppr/ppr collect
+skills/ppr/ppr respond --message "Addressed X, disagree on Y because Z"
+skills/ppr/ppr launch
+skills/ppr/ppr finish --commit --message "feat: description"
+```
