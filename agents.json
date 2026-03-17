@@ -1,0 +1,11 @@
+{
+  "claude-code": {
+    "cmd": "claude -p --permission-mode plan --output-format text \"$(cat \"$PROMPT\")\""
+  },
+  "codex": {
+    "cmd": "codex --ask-for-approval never exec --sandbox read-only -o \"$REVIEW_FILE\" - < \"$PROMPT\""
+  },
+  "gemini": {
+    "cmd": "gemini -p \"$(cat \"$PROMPT\")\" --approval-mode plan --output-format text"
+  }
+}
