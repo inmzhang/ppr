@@ -30,12 +30,10 @@ cp -r skills/ppr ~/.claude/skills/ppr
 
 ## Quick Usage
 
-The CLI supports both top-level and subcommand help:
+The CLI exposes top-level help:
 
 ```bash
 skills/ppr/ppr --help
-skills/ppr/ppr help init
-skills/ppr/ppr init --help
 ```
 
 Typical author flow:
