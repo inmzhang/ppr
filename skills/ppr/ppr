@@ -14,10 +14,22 @@
 
 set -euo pipefail
 
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+  SCRIPT_TARGET="$(readlink "$SCRIPT_SOURCE")"
+  if [[ "$SCRIPT_TARGET" = /* ]]; then
+    SCRIPT_SOURCE="$SCRIPT_TARGET"
+  else
+    SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_TARGET"
+  fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+
 PPR_DIR=".ppr"
 PPR_CONFIG="$PPR_DIR/config.json"
 PPR_STATUS="$PPR_DIR/status.json"
-PPR_AGENTS_CONFIG="${PPR_AGENTS_CONFIG:-$HOME/.config/ppr/agents.json}"
+PPR_AGENTS_CONFIG="${PPR_AGENTS_CONFIG:-$SCRIPT_DIR/agents.json}"
 
 # ==============================================================================
 # Helpers
@@ -53,6 +65,53 @@ update_status() {
   jq "$1" "$PPR_STATUS" > "$tmp" && mv "$tmp" "$PPR_STATUS"
 }
 
+generate_session_id() {
+  if command -v uuidgen > /dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+    return
+  fi
+
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    tr '[:upper:]' '[:lower:]' < /proc/sys/kernel/random/uuid
+    return
+  fi
+
+  printf '%s-%s\n' "$(date +%s)" "$RANDOM"
+}
+
+capture_snapshot_ref() {
+  local snapshot=""
+  snapshot=$(git stash create "ppr-snapshot" 2>/dev/null || true)
+  if [ -n "$snapshot" ]; then
+    echo "$snapshot"
+    return 0
+  fi
+
+  git rev-parse HEAD 2>/dev/null || true
+}
+
+review_verdict() {
+  local review_file="$1"
+
+  awk '
+    BEGIN { IGNORECASE = 1; verdict = "" }
+    /CHANGES[[:space:]]+REQUESTED/ { verdict = "changes_requested" }
+    /(^|[^[:alnum:]_])LGTM([^[:alnum:]_]|$)/ { verdict = "lgtm" }
+    END { print verdict }
+  ' "$review_file"
+}
+
+agent_config_file() {
+  if [ -f "$PPR_DIR/agents.json" ]; then
+    echo "$PPR_DIR/agents.json"
+  elif [ -f "$PPR_AGENTS_CONFIG" ]; then
+    echo "$PPR_AGENTS_CONFIG"
+  else
+    die "no agents.json found — create one at .ppr/agents.json or $PPR_AGENTS_CONFIG
+See 'ppr help' for the expected format."
+  fi
+}
+
 # ==============================================================================
 # Agent configuration
 #
@@ -68,22 +127,22 @@ update_status() {
 # }
 # ==============================================================================
 
+load_agent_field() {
+  local agent_type="$1"
+  local field_name="$2"
+  local config_file=""
+  config_file=$(agent_config_file)
+
+  jq -r --arg t "$agent_type" --arg f "$field_name" '.[$t][$f] // empty' "$config_file"
+}
+
 load_agent_cmd() {
   local agent_type="$1"
-
-  # Check project-local config first, then user-global config
-  local config_file=""
-  if [ -f "$PPR_DIR/agents.json" ]; then
-    config_file="$PPR_DIR/agents.json"
-  elif [ -f "$PPR_AGENTS_CONFIG" ]; then
-    config_file="$PPR_AGENTS_CONFIG"
-  else
-    die "no agents.json found — create one at $PPR_AGENTS_CONFIG or .ppr/agents.json
-See 'ppr help' for the expected format."
-  fi
-
   local cmd
-  cmd=$(jq -r --arg t "$agent_type" '.[$t].cmd // empty' "$config_file")
+  local config_file=""
+  config_file=$(agent_config_file)
+
+  cmd=$(load_agent_field "$agent_type" "cmd")
   [ -n "$cmd" ] || die "agent type '$agent_type' not found in $config_file"
   echo "$cmd"
 }
@@ -140,6 +199,11 @@ cmd_init() {
     echo "(No additional context provided by author.)" > "$PPR_DIR/round-1/context.md"
   fi
 
+  local snapshot_ref=""
+  snapshot_ref=$(capture_snapshot_ref)
+  [ -n "$snapshot_ref" ] || die "failed to capture current review snapshot"
+  echo "$snapshot_ref" > "$PPR_DIR/round-1/snapshot.rev"
+
   # Build config and status JSON from the reviewer list
   local reviewer_config="{}"
   local reviewer_status="{}"
@@ -147,9 +211,11 @@ cmd_init() {
   for pair in "${pairs[@]}"; do
     local agent_type="${pair%%:*}"
     local agent_name="${pair##*:}"
+    local session_id=""
+    session_id=$(generate_session_id)
     reviewer_config=$(echo "$reviewer_config" | jq \
-      --arg name "$agent_name" --arg type "$agent_type" \
-      '. + {($name): {"type": $type}}')
+      --arg name "$agent_name" --arg type "$agent_type" --arg session_id "$session_id" \
+      '. + {($name): {"type": $type, "session_id": $session_id}}')
     reviewer_status=$(echo "$reviewer_status" | jq \
       --arg name "$agent_name" \
       '. + {($name): {"status": "pending", "lgtm": false}}')
@@ -195,6 +261,12 @@ cmd_launch() {
     agent_type=$(jq -r --arg n "$name" '.reviewers[$n].type' "$PPR_CONFIG")
     local cmd_template
     cmd_template=$(load_agent_cmd "$agent_type")
+    local session_cmd_template=""
+    session_cmd_template=$(load_agent_field "$agent_type" "session_cmd")
+    local active_template="$cmd_template"
+    if [ "$round" -gt 1 ] && [ -n "$session_cmd_template" ]; then
+      active_template="$session_cmd_template"
+    fi
 
     local status
     status=$(get_reviewer_status "$name")
@@ -209,10 +281,14 @@ cmd_launch() {
 
     # Replace placeholders and launch in background
     local review_file="$rdir/reviews/$name.md"
-    local cmd="${cmd_template//\$PROMPT/$prompt_file}"
+    local session_id=""
+    session_id=$(jq -r --arg n "$name" '.reviewers[$n].session_id // empty' "$PPR_CONFIG")
+    local cmd="${active_template//\$PROMPT/$prompt_file}"
     cmd="${cmd//\$REVIEW_FILE/$review_file}"
+    cmd="${cmd//\$SESSION_ID/$session_id}"
     local stdout_target="$review_file"
-    if [[ "$cmd_template" == *'$REVIEW_FILE'* ]]; then
+    # shellcheck disable=SC2016 — we intentionally match the literal placeholder
+    if [[ "$active_template" == *'$REVIEW_FILE'* ]]; then
       stdout_target="$rdir/reviews/.stdout-$name.log"
     fi
 
@@ -353,14 +429,16 @@ cmd_status() {
     # Auto-detect completion: if the review file exists and has content,
     # mark the reviewer as done.
     if [ "$status" = "reviewing" ] && [ -f "$review_file" ] && [ -s "$review_file" ]; then
-      # Check if review contains LGTM
-      if grep -qi "^[*_]*LGTM[*_]*$\|^LGTM" "$review_file" 2>/dev/null; then
+      local verdict=""
+      verdict=$(review_verdict "$review_file")
+      if [ "$verdict" = "lgtm" ]; then
         update_status ".reviewers[\"$reviewer\"].status = \"done\" | .reviewers[\"$reviewer\"].lgtm = true"
         status="done"
         lgtm="true"
       else
-        update_status ".reviewers[\"$reviewer\"].status = \"done\""
+        update_status ".reviewers[\"$reviewer\"].status = \"done\" | .reviewers[\"$reviewer\"].lgtm = false"
         status="done"
+        lgtm="false"
       fi
     fi
 
@@ -523,12 +601,30 @@ cmd_respond() {
   next_dir=$(round_dir "$next_round")
   mkdir -p "$next_dir/reviews"
 
-  # Capture current diff as the new changeset
+  # Capture the new changeset as the diff between the previous round snapshot
+  # and the current tracked workspace snapshot.
   local diff_content=""
-  diff_content=$(git diff --cached 2>/dev/null) || true
-  [ -n "$diff_content" ] || diff_content=$(git diff 2>/dev/null) || true
+  local prev_snapshot=""
+  local current_snapshot=""
+  if [ -f "$rdir/snapshot.rev" ]; then
+    prev_snapshot=$(cat "$rdir/snapshot.rev")
+  fi
+  current_snapshot=$(capture_snapshot_ref)
+
+  if [ -n "$prev_snapshot" ] && [ -n "$current_snapshot" ]; then
+    diff_content=$(git diff "$prev_snapshot" "$current_snapshot" 2>/dev/null) || true
+  else
+    diff_content=$(git diff --cached 2>/dev/null) || true
+    [ -n "$diff_content" ] || diff_content=$(git diff 2>/dev/null) || true
+  fi
+
   [ -n "$diff_content" ] || echo "(No new changes since last round.)" > "$next_dir/changes.diff"
   [ -z "$diff_content" ] || echo "$diff_content" > "$next_dir/changes.diff"
+  if [ -n "$current_snapshot" ]; then
+    echo "$current_snapshot" > "$next_dir/snapshot.rev"
+  elif [ -n "$prev_snapshot" ]; then
+    echo "$prev_snapshot" > "$next_dir/snapshot.rev"
+  fi
 
   # Carry forward context
   if [ -n "$message" ]; then
@@ -679,12 +775,13 @@ Commands:
 Agent Configuration:
   ppr reads agent launch commands from agents.json. It checks:
     1. .ppr/agents.json (project-local)
-    2. ~/.config/ppr/agents.json (user-global)
+    2. agents.json next to the ppr script
 
   Example agents.json:
   {
     "claude-code": {
-      "cmd": "claude -p --permission-mode plan --output-format text \"$(cat \"$PROMPT\")\""
+      "cmd": "claude -p --session-id \"$SESSION_ID\" --permission-mode plan --output-format text \"$(cat \"$PROMPT\")\"",
+      "session_cmd": "claude -p --resume \"$SESSION_ID\" --permission-mode plan --output-format text \"$(cat \"$PROMPT\")\""
     },
     "codex": {
       "cmd": "codex --ask-for-approval never exec --sandbox read-only -o \"$REVIEW_FILE\" - < \"$PROMPT\""
@@ -697,11 +794,13 @@ Agent Configuration:
   The $PROMPT placeholder is replaced with the path to a temporary file
   containing the reviewer's prompt. The optional $REVIEW_FILE placeholder is
   replaced with the destination markdown file for CLIs that support writing
-  only the final answer to a path. If $REVIEW_FILE is not used, ppr captures
-  stdout into the per-reviewer markdown file.
+  only the final answer to a path. The optional $SESSION_ID placeholder is a
+  stable per-reviewer session identifier. If a session_cmd template is
+  provided, ppr uses it from round 2 onward. If $REVIEW_FILE is not used, ppr
+  captures stdout into the per-reviewer markdown file.
 
 Environment:
-  PPR_AGENTS_CONFIG  Path to agents.json (default: ~/.config/ppr/agents.json)
+  PPR_AGENTS_CONFIG  Path to agents.json (default: agents.json next to ppr)
 
 HELP
 }
